@@ -1,84 +1,79 @@
 """
-Scraper pour trouverunlogement.lescrous.fr
+Scraper léger pour trouverunlogement.lescrous.fr — SANS navigateur.
 
-Le site est une application JavaScript (SPA) qui appelle une API interne
-(/api/fr/search/{tool_id}) pour charger les résultats. Plutôt que de parser
-le HTML rendu (fragile, dépend du design), on utilise Playwright pour
-charger la page normalement, puis on intercepte directement la réponse
-JSON de cette API — c'est la donnée brute, fiable et complète (prix,
-adresse, surface, équipements...).
+Le site est une SPA qui appelle une API interne en POST :
+    POST /api/fr/search/{tool_id}
+avec un corps JSON contenant les coordonnées de la zone recherchée.
+
+On a vérifié (voir debug) que cette API répond correctement à un appel
+HTTP direct avec `requests`, sans avoir besoin de faire tourner un vrai
+navigateur. C'est donc plus rapide, plus léger (pas de Chromium à
+installer), et ça fonctionne sur n'importe quel hébergement basique.
 """
 
 import json
 import re
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+import requests
 
 BASE_URL = "https://trouverunlogement.lescrous.fr"
 DEBUG_DIR = Path(__file__).parent / "debug"
-SEARCH_API_RE = re.compile(r"/api/fr/search/(\d+)")
+
+BOUNDS_RE = re.compile(r"bounds=([\-0-9.]+)_([\-0-9.]+)_([\-0-9.]+)_([\-0-9.]+)")
 TOOL_ID_RE = re.compile(r"/tools/(\d+)/")
 
-
-def _dismiss_cookie_banner(page):
-    """Ferme le bandeau de consentement cookies (RGPD) s'il est présent.
-    Sur les sites gouv.fr, ce bandeau peut bloquer le reste de la page
-    tant qu'on n'a pas cliqué dessus."""
-    page.wait_for_timeout(1200)
-    selectors = [
-        "#tarteaucitronPersonalize2All",
-        "#tarteaucitronAllAllowed",
-        "button:has-text('Tout accepter')",
-        "button:has-text('Accepter tout')",
-        "button:has-text('Accepter')",
-        "button:has-text(\"J'accepte\")",
-    ]
-    for sel in selectors:
-        try:
-            btn = page.query_selector(sel)
-            if btn and btn.is_visible():
-                btn.click(timeout=3000)
-                print("🍪 Bandeau cookies fermé.")
-                page.wait_for_timeout(1500)
-                return True
-        except Exception:
-            continue
-    return False
+HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/ld+json, application/json",
+    "Accept-Language": "fr-FR",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Origin": BASE_URL,
+}
 
 
-def _save_debug(page, api_responses):
-    DEBUG_DIR.mkdir(exist_ok=True)
-    try:
-        page.screenshot(path=str(DEBUG_DIR / "page.png"), full_page=True)
-        (DEBUG_DIR / "page.html").write_text(page.content(), encoding="utf-8")
-        print(f"🔍 Debug sauvegardé dans {DEBUG_DIR}/ (screenshot + html)")
-    except Exception as e:
-        print(f"Impossible de sauvegarder le debug (screenshot/html) : {e}")
+def _build_payload(search_url: str) -> tuple[str, dict]:
+    """Construit le tool_id et le corps JSON de la requête de recherche à
+    partir de l'URL de recherche fournie par l'utilisateur (celle copiée
+    depuis la barre d'adresse du site)."""
+    tool_match = TOOL_ID_RE.search(search_url)
+    if not tool_match:
+        raise ValueError(
+            f"Impossible de trouver l'identifiant d'outil (/tools/XX/) dans l'URL : {search_url}"
+        )
+    tool_id = tool_match.group(1)
 
-    if api_responses:
-        api_dir = DEBUG_DIR / "api_responses"
-        api_dir.mkdir(exist_ok=True)
-        index_lines = []
-        for i, (url, body, meta) in enumerate(api_responses):
-            fname = f"response_{i}.json"
-            meta_fname = f"response_{i}_request.txt"
-            try:
-                (api_dir / fname).write_text(body, encoding="utf-8")
-                (api_dir / meta_fname).write_text(meta, encoding="utf-8")
-            except Exception:
-                pass
-            index_lines.append(f"{fname} <- {url}")
-        (DEBUG_DIR / "api_urls.txt").write_text("\n".join(index_lines), encoding="utf-8")
-        print(f"🔍 {len(api_responses)} réponse(s) réseau JSON sauvegardée(s) dans {api_dir}/")
-    else:
-        print("🔍 Aucune réponse réseau JSON détectée pendant le chargement.")
+    bounds_match = BOUNDS_RE.search(search_url)
+    if not bounds_match:
+        raise ValueError(f"Impossible de trouver les 'bounds' (coordonnées) dans l'URL : {search_url}")
+    lon1, lat1, lon2, lat2 = (float(x) for x in bounds_match.groups())
+
+    payload = {
+        "idTool": int(tool_id),
+        "need_aggregation": True,
+        "page": 1,
+        "pageSize": 24,
+        "sector": None,
+        "occupationModes": [],
+        "location": [{"lon": lon1, "lat": lat1}, {"lon": lon2, "lat": lat2}],
+        "residence": None,
+        "precision": 5,
+        "equipment": [],
+        "price": {"max": 10000000},
+        "area": {"min": 0},
+        "adaptedPmr": False,
+        "toolMechanism": "residual",
+    }
+    return tool_id, payload
 
 
-def _parse_search_json(body: str, tool_id: str) -> list[dict]:
+def _parse_search_json(data: dict, tool_id: str) -> list[dict]:
     """Transforme le JSON brut de l'API de recherche en liste de logements
     exploitables (id, titre, prix, surface, adresse, lien direct)."""
-    data = json.loads(body)
     items = data.get("results", {}).get("items", [])
     listings = []
 
@@ -95,8 +90,6 @@ def _parse_search_json(body: str, tool_id: str) -> list[dict]:
         else:
             area_str = ""
 
-        # Le loyer est en centimes ; on prend le mode d'occupation "alone"
-        # en priorité, sinon le premier disponible.
         occupation_modes = item.get("occupationModes", [])
         rent_cents = None
         for mode in occupation_modes:
@@ -127,81 +120,50 @@ def _parse_search_json(body: str, tool_id: str) -> list[dict]:
     return listings
 
 
+def _save_debug(label: str, content: str):
+    DEBUG_DIR.mkdir(exist_ok=True)
+    (DEBUG_DIR / f"{label}.txt").write_text(content, encoding="utf-8")
+    print(f"🔍 Debug sauvegardé dans {DEBUG_DIR}/{label}.txt")
+
+
 def fetch_listings(search_url: str, headless: bool = True) -> list[dict]:
-    """Retourne une liste de dicts : id, title, price, details, link."""
-    api_responses: list[tuple[str, str, str]] = []
-    search_json_body: str | None = None
+    """Retourne une liste de dicts : id, title, price, details, link.
+    (le paramètre `headless` est conservé pour compatibilité avec le reste
+    du projet, mais n'a plus d'effet : il n'y a plus de navigateur.)"""
+    tool_id, payload = _build_payload(search_url)
 
-    tool_id_match = TOOL_ID_RE.search(search_url)
-    tool_id = tool_id_match.group(1) if tool_id_match else "47"
+    headers = dict(HEADERS)
+    headers["Referer"] = search_url
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            locale="fr-FR",
-            viewport={"width": 1366, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/api/fr/search/{tool_id}",
+            data=json.dumps(payload),
+            headers=headers,
+            timeout=20,
         )
-        page = context.new_page()
+    except requests.RequestException as e:
+        print(f"⚠️ Erreur réseau lors de l'appel à l'API : {e}")
+        return []
 
-        def on_response(response):
-            nonlocal search_json_body
-            try:
-                ctype = response.headers.get("content-type", "")
-                if "application/json" in ctype and response.request.resource_type in ("xhr", "fetch"):
-                    body = response.text()
-                    req = response.request
-                    meta = (
-                        f"METHOD: {req.method}\n"
-                        f"URL: {req.url}\n"
-                        f"POST DATA: {req.post_data}\n"
-                    )
-                    api_responses.append((response.url, body, meta))
-                    if SEARCH_API_RE.search(response.url):
-                        search_json_body = body
-            except Exception:
-                pass  # certaines réponses ne sont pas lisibles (déjà consommées, etc.)
+    if resp.status_code != 200:
+        print(f"⚠️ L'API a répondu avec le statut {resp.status_code} (attendu 200).")
+        _save_debug("api_error_response", f"Status: {resp.status_code}\n\n{resp.text[:2000]}")
+        return []
 
-        page.on("response", on_response)
+    try:
+        data = resp.json()
+    except ValueError:
+        print("⚠️ La réponse de l'API n'est pas du JSON valide.")
+        _save_debug("api_invalid_response", resp.text[:2000])
+        return []
 
-        try:
-            page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
-        except Exception as e:
-            print(f"⚠️ Le chargement de la page a été lent/interrompu ({e}). "
-                  "On continue quand même avec ce qui a été chargé.")
-
-        page.wait_for_timeout(2000)
-        _dismiss_cookie_banner(page)
-
-        # Attend activement la réponse de l'API de recherche (jusqu'à 20s)
-        elapsed = 0
-        while search_json_body is None and elapsed < 20000:
-            page.wait_for_timeout(1000)
-            elapsed += 1000
-
-        page_text = page.content().lower()
-        if "trop nombreux" in page_text:
-            print("⚠️ Le site indique 'Vous êtes trop nombreux' (limite de trafic). "
-                  "Réessaie plus tard ou espace davantage les vérifications.")
-            _save_debug(page, api_responses)
-            browser.close()
-            return []
-
-        listings = []
-        if search_json_body:
-            try:
-                listings = _parse_search_json(search_json_body, tool_id)
-            except Exception as e:
-                print(f"⚠️ Erreur en parsant la réponse de l'API de recherche : {e}")
-
-        if not listings:
-            _save_debug(page, api_responses)
-
-        browser.close()
+    try:
+        listings = _parse_search_json(data, tool_id)
+    except Exception as e:
+        print(f"⚠️ Erreur en parsant la réponse de l'API : {e}")
+        _save_debug("api_parse_error", json.dumps(data, indent=2, ensure_ascii=False)[:3000])
+        return []
 
     return listings
 
@@ -217,7 +179,7 @@ if __name__ == "__main__":
     if not url:
         raise SystemExit("Définis SEARCH_URL dans ton .env avant de tester.")
 
-    found = fetch_listings(url, headless=False)
+    found = fetch_listings(url)
     print(f"{len(found)} logement(s) trouvé(s) :")
     for item in found:
         print(f"- {item['title']} | {item['price']} | {item['details']} | {item['link']}")

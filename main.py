@@ -56,9 +56,9 @@ def build_email_html(new_listings: list[dict]) -> str:
     """
 
 
-def run_once(search_url: str, headless: bool = True) -> None:
+def run_once(search_url: str) -> None:
     seen = load_seen_ids()
-    listings = fetch_listings(search_url, headless=headless)
+    listings = fetch_listings(search_url)
     print(f"{len(listings)} logement(s) trouvés sur la page de recherche.")
 
     new_listings = [l for l in listings if l["id"] not in seen]
@@ -89,7 +89,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bot de notification logements CROUS")
     parser.add_argument("--loop", action="store_true", help="Tourner en continu (sinon: une seule vérification, pour cron)")
     parser.add_argument("--interval", type=int, default=int(os.getenv("CHECK_INTERVAL_MINUTES", 15)), help="Minutes entre deux vérifications en mode --loop")
-    parser.add_argument("--show-browser", action="store_true", help="Afficher le navigateur (utile pour déboguer)")
     args = parser.parse_args()
 
     search_url = os.getenv("SEARCH_URL")
@@ -100,9 +99,9 @@ if __name__ == "__main__":
         print(f"🔁 Mode boucle : vérification toutes les {args.interval} minutes. Ctrl+C pour arrêter.")
         while True:
             try:
-                run_once(search_url, headless=not args.show_browser)
+                run_once(search_url)
             except Exception as e:
                 print(f"⚠️ Erreur pendant la vérification : {e}")
             time.sleep(args.interval * 60)
     else:
-        run_once(search_url, headless=not args.show_browser)
+        run_once(search_url)

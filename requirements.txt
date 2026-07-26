@@ -1,2 +1,2 @@
-playwright>=1.48
+requests>=2.32
 python-dotenv>=1.0.1

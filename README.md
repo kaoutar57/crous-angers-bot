@@ -1,25 +1,16 @@
 # Bot de notification logements CROUS — Angers
 
-Surveille la page de recherche de logements du CROUS pour Angers et envoie
-un email dès qu'un nouveau logement apparaît, avec le prix, les détails et
-le lien direct.
+Surveille l'API du CROUS pour Angers et envoie un email dès qu'un nouveau
+logement apparaît, avec le prix, les détails et le lien direct.
 
-## ⚠️ À savoir avant de commencer
+## Comment ça marche
 
-- Le site `trouverunlogement.lescrous.fr` est une application JavaScript :
-  le scraper utilise donc un vrai navigateur headless (Playwright), pas de
-  simple requête HTTP.
-- Le site affiche parfois un message **"Vous êtes trop nombreux"** en cas
-  de forte affluence. C'est un mécanisme anti-surcharge du site — le script
-  le détecte et réessaiera au prochain passage. **Ne mets pas un intervalle
-  trop court** (15–30 minutes est raisonnable) pour rester correct vis-à-vis
-  du site et éviter d'être bloqué.
-- Le HTML du site peut changer sans préavis. Le scraper est volontairement
-  écrit de façon "générique" (il repère les liens contenant un prix "xxx €")
-  plutôt que de dépendre de classes CSS précises, mais si CROUS refait leur
-  site, il faudra l'ajuster. En cas de souci, lance `python scraper.py`
-  (voir plus bas) : si rien n'est trouvé, un screenshot + le HTML de la page
-  sont sauvegardés dans `debug/` pour comprendre ce qui a changé.
+Le site `trouverunlogement.lescrous.fr` est une application JavaScript qui
+appelle une API interne (`/api/fr/search/{tool_id}`) pour charger les
+résultats. Le bot appelle **directement cette API en HTTP** (via la
+librairie `requests`) — pas besoin de navigateur, pas de Playwright, pas
+de Chromium à installer. C'est rapide, léger, et ça tourne sur à peu près
+n'importe quel hébergement.
 
 ## Installation
 
@@ -29,8 +20,9 @@ python -m venv venv
 source venv/bin/activate        # Windows : venv\Scripts\activate
 
 pip install -r requirements.txt
-playwright install chromium     # télécharge le navigateur headless
 ```
+
+C'est tout — pas d'étape `playwright install`, plus besoin.
 
 ## Configuration
 
@@ -40,7 +32,8 @@ cp .env.example .env
 
 Puis édite `.env` :
 
-- `SEARCH_URL` : déjà pré-rempli avec ton URL Angers.
+- `SEARCH_URL` : l'URL de recherche copiée depuis la barre d'adresse du
+  site (doit contenir `/tools/XX/` et `bounds=...`).
 - `SMTP_*` / `EMAIL_*` : tes identifiants d'envoi d'email.
 
 ### Configurer Gmail comme expéditeur
@@ -51,9 +44,6 @@ Puis édite `.env` :
 3. Utilise ce mot de passe (pas ton mot de passe Gmail normal) dans
    `SMTP_PASSWORD`.
 
-(Tu peux aussi utiliser n'importe quel autre fournisseur SMTP : Outlook,
-OVH, Infomaniak, etc. — change juste `SMTP_HOST` / `SMTP_PORT`.)
-
 ## Utilisation
 
 **Une seule vérification** (idéal pour être lancé par une tâche planifiée) :
@@ -62,20 +52,13 @@ OVH, Infomaniak, etc. — change juste `SMTP_HOST` / `SMTP_PORT`.)
 python main.py
 ```
 
-**Mode boucle continue** (le script tourne et vérifie toutes les X minutes) :
+**Mode boucle continue** :
 
 ```bash
-python main.py --loop --interval 20
+python main.py --loop --interval 5
 ```
 
-**Mode debug** (affiche le navigateur pour voir ce qu'il se passe) :
-
-```bash
-python main.py --show-browser
-```
-
-Le fichier `state.json` garde la mémoire des logements déjà notifiés, pour
-ne jamais renvoyer deux fois le même email.
+Le fichier `state.json` garde la mémoire des logements déjà notifiés.
 
 ## Planifier des vérifications automatiques
 
@@ -147,13 +130,43 @@ ton PC allumé.
 
 **⚠️ Budget de minutes gratuites :** sur un compte GitHub gratuit, un dépôt
 **privé** a droit à 2000 minutes/mois gratuites ; un dépôt **public** a des
-minutes illimitées. Comme Chromium doit être installé à chaque run (même
-avec le cache activé dans le workflow, il faut installer ses dépendances
-système), reste prudent avec l'intervalle si ton dépôt est privé : 30 min
-convient bien, 15 min ferait probablement dépasser le quota gratuit. Aucune
-donnée sensible n'est exposée si le dépôt est public — seuls les résultats
-de la recherche CROUS (déjà publics) et le code sont visibles, jamais tes
-identifiants SMTP (stockés en tant que secrets chiffrés).
+minutes illimitées. Maintenant que le bot n'utilise plus Chromium, chaque
+run dure environ 5-10 secondes — même avec un intervalle de 5 minutes
+(≈ 8600 runs/mois), tu restes largement dans le quota gratuit, y compris
+en dépôt privé.
+
+## Alternative : héberger sur Wispbyte
+
+Maintenant que le bot n'a plus besoin de navigateur (juste `requests` +
+`python-dotenv`, quelques Mo), un hébergement léger comme
+[Wispbyte](https://wispbyte.com) devient tout à fait viable — ce n'était
+pas le cas avec la version Playwright, trop lourde pour ce type
+d'hébergement gratuit.
+
+**Mise en place (via le panel Wispbyte) :**
+
+1. Crée un serveur avec l'egg **"Python"** (ou "Generic"), en choisissant
+   une version Python récente (3.11+).
+2. Upload tous les fichiers du projet **sauf** `venv/`, `debug/`,
+   `__pycache__/` — via l'onglet fichiers du panel, ou en connectant le
+   dépôt Git si l'option est proposée.
+3. Configure les variables d'environnement dans l'onglet "Startup" ou
+   "Variables" du panel (équivalent de ton `.env`) : `SEARCH_URL`,
+   `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`,
+   `EMAIL_TO`.
+4. Définis la commande de démarrage ("Startup Command") :
+   ```
+   pip install -r requirements.txt && python main.py --loop --interval 5
+   ```
+5. Démarre le serveur — comme c'est un process qui tourne en continu
+   (`--loop`), pas besoin de cron ici, contrairement à GitHub Actions.
+
+**Point d'attention :** vérifie les limites du plan gratuit de Wispbyte
+(RAM, uptime garanti) au moment de la mise en place — les plans gratuits
+évoluent et je n'ai pas un accès direct à leurs specs actuelles.
+Contrairement à GitHub Actions, ce n'est pas un service géré par un grand
+fournisseur cloud (Microsoft/GitHub) : à toi de juger le niveau de fiabilité
+que tu attends pour un usage régulier.
 
 ## Structure du projet
 
