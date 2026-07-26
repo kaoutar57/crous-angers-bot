@@ -1,0 +1,63 @@
+name: Vérification logements CROUS
+
+on:
+  schedule:
+    
+    - cron: '*/2 * * * *'
+  workflow_dispatch: {}   # permet de lancer manuellement depuis l'onglet "Actions" du repo
+
+permissions:
+  contents: write   # nécessaire pour committer state.json après chaque run
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installer les dépendances Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Met en cache le navigateur Chromium de Playwright pour éviter de le
+      # re-télécharger (~150 Mo) à chaque exécution -> runs bien plus rapides.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Installer Chromium (si pas déjà en cache)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Installer les dépendances système de Chromium (même si en cache)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      - name: Lancer la vérification
+        env:
+          SEARCH_URL: ${{ secrets.SEARCH_URL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python main.py
+
+      - name: Sauvegarder l'état (state.json) dans le dépôt
+        run: |
+          git config user.name "crous-bot"
+          git config user.email "crous-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "update state.json [skip ci]"
+          git push
