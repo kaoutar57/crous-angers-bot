@@ -3,7 +3,7 @@ name: Vérification logements CROUS
 on:
   schedule:
     
-    - cron: '*/2 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}   # permet de lancer manuellement depuis l'onglet "Actions" du repo
 
 permissions:
